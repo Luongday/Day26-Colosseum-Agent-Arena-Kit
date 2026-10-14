@@ -95,6 +95,12 @@ __all__ = [
     "is_catalog_trap",
     "cheap_mask",
     "successor_of",
+    "ROUND_CAP",
+    "round_allowance",
+    "estimate_cost",
+    "sanitise_fields",
+    "narrow_fields",
+    "remap_deprecated_fields",
     "BudgetPacer",
     "ReplicaChoice",
     "pick_replica",
@@ -190,6 +196,89 @@ def successor_of(server: str, tool: str) -> tuple[str, str] | None:
     return DEPRECATED_SUCCESSORS.get((server, tool))
 
 
+
+# `wasteful` (CONTRACTS 6.4) fires once a round's credits exceed the allowance the
+# referee itself blesses: FINAL-PLAN 4.3's "disciplined round", 11 credits.
+ROUND_CAP = 11
+
+
+def round_allowance(credits_left: int, round_no: int, rounds_total: int = ROUNDS_PER_DUEL, *, cap: int = ROUND_CAP) -> int:
+    """How many credits THIS round may spend, from what is actually left.
+
+    Pace the remaining pool evenly over the rounds still to play (this round
+    included) plus one credit of slack, never above `cap` -- the number the
+    `wasteful` detector uses. Spending evenly from the live balance means an
+    expensive early round automatically tightens later ones instead of leaving
+    round 9 bankrupt, and a frugal early round lets a later one afford a
+    corroborating call. A floor of 4 keeps even a nearly empty pool able to
+    afford one cheap read-plus-lookup (provenance 1 + glossary 1 + ...)."""
+    rounds_left = max(1, rounds_total - max(1, round_no) + 1)
+    pace = -(-max(0, credits_left) // rounds_left) + 1  # ceil division + 1 slack
+    return max(4, min(cap, pace))
+
+
+def estimate_cost(server: str, tool: str, fields: tuple[str, ...] = (), n_rows: int = 1) -> int:
+    """`kit.mcp.specs.cost` for a known tool, else the degraded fallback's
+    honest "I don't know" default. Never raises -- a pure estimate for a
+    `decide()` that must not blow up."""
+    try:
+        return int(_spec_cost(server, tool, tuple(fields), n_rows))
+    except Exception:
+        return 5
+
+
+def sanitise_fields(server: str, tool: str, fields: tuple[str, ...]) -> tuple[str, ...]:
+    """Drop mask entries the tool does not have (they only earn a `bad_request`
+    that is still charged). `()` and `("*",)` pass through untouched; an
+    unknown tool passes through untouched; a mask that sanitises to nothing
+    falls back to `()` -- the tool's default."""
+    spec = TOOL_SPECS.get((server, tool)) if _SPECS_AVAILABLE else None
+    if spec is None or not fields or tuple(fields) == ("*",):
+        return tuple(fields)
+    kept = tuple(sorted({f for f in fields if f in spec.all_fields}))
+    return kept
+
+
+def narrow_fields(server: str, tool: str, fields: tuple[str, ...]) -> tuple[str, ...]:
+    """Mask discipline as a function: never pay for `("*",)` and never pay a
+    catalog tool's default dump.
+
+      * `("*",)` on a known tool -> that tool's own cheap default mask (and for
+        the two catalog tools, a single identifying field);
+      * `()` on `registry.list_servers` / `glossary.list_terms` -> likewise,
+        because their DEFAULT is the full dump (`is_catalog_trap`);
+      * any other explicit mask is respected after `sanitise_fields` -- the model
+        decided what it will cite, and removing a field it asked for turns a right
+        answer into `ungrounded`.
+    """
+    fields = tuple(fields)
+    if (server, tool) in CATALOG_TRAP_TOOLS and fields in ((), ("*",)):
+        return ("name",) if tool == "list_servers" else ("term",)
+    spec = TOOL_SPECS.get((server, tool)) if _SPECS_AVAILABLE else None
+    if fields == ("*",):
+        return tuple(spec.default_fields) if spec is not None else ()
+    return sanitise_fields(server, tool, fields)
+
+
+# Field vocabulary shared by a deprecated tool and its successor: `slides.search`
+# returns {anchor, snippet, title}; `slides.query` returns {body, score, title}.
+_FIELD_REMAP: Mapping[tuple[str, str], Mapping[str, str]] = {
+    ("slides", "search"): {"title": "title", "snippet": "body", "anchor": "title"},
+}
+
+
+def remap_deprecated_fields(server: str, tool: str, fields: tuple[str, ...]) -> tuple[str, ...]:
+    """Translate a deprecated tool's mask into its successor's vocabulary, so a
+    rewrite `slides.search` -> `slides.query` asks for the same information
+    rather than for fields the successor does not have."""
+    table = _FIELD_REMAP.get((server, tool))
+    succ = successor_of(server, tool)
+    if table is None or succ is None:
+        return tuple(fields)
+    mapped = {table[f] for f in fields if f in table}
+    return sanitise_fields(succ[0], succ[1], tuple(sorted(mapped)))
+
+
 @dataclass
 class BudgetPacer:
     """Tracks YOUR OWN running spend across a duel and answers one
@@ -256,36 +345,35 @@ class ReplicaChoice:
     reason: str
 
 
-def pick_replica(*, path_id: str | None, known_drifting: bool, prefers_fresh: bool = True) -> ReplicaChoice:
-    """A starting heuristic for JOB 1 (ROUTE) in `agent/gateway.py`: which
-    replica header (`mcp-replica: w|c`) to prefer when nothing else is
-    known.
+def pick_replica(
+    *,
+    path_id: str | None,
+    known_drifting: bool,
+    prefers_fresh: bool = True,
+    fresher: str | None = None,
+) -> ReplicaChoice:
+    """JOB 1 (ROUTE): which `mcp-replica` header (`w` | `c`) to send.
 
-    `known_drifting` is YOUR OWN judgement call, not something this
-    function derives — a real implementation reads it from a
-    `registry.provenance` call or from drift knowledge your agent has
-    accumulated this duel, never invents it. `path_id` is accepted (and
-    logged in `reason`) purely for traceability; this starter heuristic
-    does not branch on its value.
+    Order of evidence, strongest first:
+      1. `fresher` -- a REAL signal: the replica a `current_version_of` ask, a
+         `registry.provenance` timestamp or a prior cross-check actually said is
+         fresher. If you have it, use it.
+      2. otherwise `w` (working), for ANY value of `known_drifting`.
 
-    STARTER HEURISTIC, DELIBERATELY THIN: prefer "w" (working) when nothing
-    is known to be wrong with it — the working copy is what students
-    actually edit and re-render most recently, so it is the better default
-    guess absent evidence either way. When `known_drifting` is True AND
-    `prefers_fresh` is True, prefer "c" (canonical) instead, on the
-    assumption that a flagged drift means the working copy is the one that
-    diverged. THIS ASSUMPTION IS OFTEN WRONG — CORPUS-FACTS.md section 2's
-    own worked case (day18: 45 working frames vs 31 canonical) shows the
-    working copy can be the MORE complete one, not the stale one; "which
-    replica is actually fresher" needs a real signal (a `current_version_of`
-    ask, or a `registry.provenance` timestamp), not a coin flip on which
-    letter comes first. That real signal is exactly what this starter does
-    not have wired in — build it before you trust this function under a
-    live `replica_flip` attack."""
+    The earlier starter flipped to `c` whenever a path was flagged as drifting.
+    That is a coin toss dressed up as a rule: CORPUS-FACTS 2's own worked case
+    (day18: 45 working frames vs 31 canonical) shows the working copy is the MORE
+    complete one, so "drifting -> canonical" is wrong exactly where it matters.
+    Drift tells you the two replicas DISAGREE, not which one is right -- so a
+    drifting path with no `fresher` evidence stays on `w` and the reason says the
+    choice is unresolved, which is the honest cue for the answer to flag the
+    disagreement (`unflagged_conflict`) instead of silently picking a side."""
+    if fresher in ("w", "c"):
+        return ReplicaChoice(replica=fresher, reason=f"path_id={path_id!r}: provenance says {fresher!r} is fresher")
     if known_drifting and prefers_fresh:
         return ReplicaChoice(
-            replica="c",
-            reason=f"path_id={path_id!r} is known to drift this duel; preferring canonical as the naive fresher guess",
+            replica="w",
+            reason=f"path_id={path_id!r} drifts but no replica is known fresher; default 'w' and flag the disagreement",
         )
     return ReplicaChoice(replica="w", reason=f"path_id={path_id!r}: no known drift; default to working")
 
@@ -396,26 +484,27 @@ if __name__ == "__main__":
     assert succ == ("slides", "query")
     assert successor_of("slides", "query") is None
 
-    print("\n=== BudgetPacer: disciplined-at-the-CEILING barely lasts the duel; careless does not ===\n")
+    print("\n=== BudgetPacer: a disciplined round affords the whole duel; a careless one does not ===\n")
     disciplined_pacer = BudgetPacer()
     for round_no in range(1, ROUNDS_PER_DUEL + 1):
         disciplined_pacer.record_spend(round_no, disciplined)
     print(
-        f"  disciplined (ceiling, {disciplined}cr) x10 rounds -> spent={disciplined_pacer.credits_spent} "
+        f"  disciplined ({disciplined}cr) x10 rounds -> spent={disciplined_pacer.credits_spent} "
         f"credits_left={disciplined_pacer.credits_left} bankrupt_by={disciplined_pacer.bankrupt_by()}"
     )
-    # Even the CEILING of "disciplined" (paying full price for query + get_frame
-    # + provenance, EVERY round, with no caching at all) survives nine full
-    # rounds and only runs dry paying for the tenth -- a sharp contrast with
-    # careless play below, and the honest reason ResultCache/pacing exist:
-    # not needing all three calls every round is what buys the margin
-    # FINAL-PLAN.md 4.3 calls "sustainable".
-    assert disciplined_pacer.bankrupt_by() == ROUNDS_PER_DUEL, disciplined_pacer.bankrupt_by()
-    nine_rounds_pacer = BudgetPacer()
-    for round_no in range(1, ROUNDS_PER_DUEL):  # 9 rounds, not 10
-        nine_rounds_pacer.record_spend(round_no, disciplined)
-    print(f"  disciplined (ceiling) x9 rounds  -> credits_left={nine_rounds_pacer.credits_left} (still positive)")
-    assert nine_rounds_pacer.credits_left >= 0
+    # The economy was retuned (kit/mcp/specs.py D-10: titles are free), so a
+    # disciplined round is now `disciplined` credits, not the 11 the original
+    # docstring computed. This demo asserts what the live table says, not a
+    # number copied into prose -- which is why it is computed, not hard-coded.
+    assert disciplined_pacer.bankrupt_by() is None, disciplined_pacer.bankrupt_by()
+    assert disciplined_pacer.credits_left == 100 - ROUNDS_PER_DUEL * disciplined
+    # ...but paying the ROUND_CAP (the wasteful ceiling) every round is the edge:
+    ceiling_pacer = BudgetPacer()
+    for round_no in range(1, ROUNDS_PER_DUEL + 1):
+        ceiling_pacer.record_spend(round_no, ROUND_CAP)
+    print(f"  at the wasteful ceiling ({ROUND_CAP}cr) x10 rounds -> bankrupt_by={ceiling_pacer.bankrupt_by()}")
+    assert ceiling_pacer.bankrupt_by() == ROUNDS_PER_DUEL  # 10 x 11 = 110 > 100: dry on the last round
+    assert ceiling_pacer.credits_left == 100 - ROUNDS_PER_DUEL * ROUND_CAP
 
     careless_pacer = BudgetPacer()
     bankrupt_round = None
@@ -439,13 +528,31 @@ if __name__ == "__main__":
     fresh_pacer = BudgetPacer()
     assert fresh_pacer.is_affordable(1, disciplined) is True
 
+    print("\n=== round_allowance / narrow_fields / remap_deprecated_fields ===\n")
+    assert round_allowance(100, 1) == 11 and round_allowance(100, 10) == 11
+    assert round_allowance(30, 8) == 11 and round_allowance(6, 10) == 7 and round_allowance(0, 10) == 4
+    assert round_allowance(50, 3) == 8
+    print(f"  allowance: 100cr@r1={round_allowance(100, 1)} 50cr@r3={round_allowance(50, 3)} 0cr@r10={round_allowance(0, 10)}")
+    assert narrow_fields("registry", "list_servers", ()) == ("name",)
+    assert narrow_fields("registry", "list_servers", ("*",)) == ("name",)
+    assert narrow_fields("glossary", "list_terms", ()) == ("term",)
+    assert narrow_fields("slides", "get_frame", ("*",)) == ("body", "title")
+    assert narrow_fields("slides", "get_frame", ("title", "nonsense")) == ("title",)
+    assert narrow_fields("slides", "get_frame", ()) == ()
+    assert remap_deprecated_fields("slides", "search", ("anchor", "snippet", "title")) == ("body", "title")
+    assert estimate_cost("slides", "get_frame", ("*",)) == 9
+    print("  catalog traps narrowed, wildcard masks narrowed, search mask remapped to query vocabulary")
+
     print("\n=== pick_replica: the naive heuristic, and why it is naive ===\n")
     choice_clean = pick_replica(path_id="d8f95a7b", known_drifting=False)
     choice_drifting = pick_replica(path_id="d8f95a7b", known_drifting=True)
+    choice_evidence = pick_replica(path_id="d8f95a7b", known_drifting=True, fresher="c")
     print(f"  known_drifting=False -> {choice_clean}")
-    print(f"  known_drifting=True  -> {choice_drifting}")
+    print(f"  known_drifting=True  -> {choice_drifting}   (no evidence: stays on w, does NOT guess c)")
+    print(f"  fresher='c' evidence -> {choice_evidence}")
     assert choice_clean.replica == "w"
-    assert choice_drifting.replica == "c"
+    assert choice_drifting.replica == "w"
+    assert choice_evidence.replica == "c"
 
     print("\n=== ResultCache: same (anchor, fields) is a hit; a wider mask is a genuine miss ===\n")
     cache = ResultCache()

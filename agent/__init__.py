@@ -7,8 +7,8 @@ classes (CONTRACTS.md section 6.1) each one can save you from.
                      (CONTRACTS.md section 4, exactly)
     strategy.py      discovery / delegation / caching / replica / budget
                      policy — building blocks, not wired in by default
-    guardrails.py    grounding (real), injection/redaction/arithmetic
-                     (named stubs), abstention (real, naive)
+    guardrails.py    grounding, injection scan, redaction, arithmetic /
+                     precision check, abstention policy -- all real
     telemetry.py     ctx.emit wrappers — your own side only, never scored
     prompt.md        the system prompt LAYERED ON TOP of kit.loop.prompt's
                      harness prompt (not a replacement for it)
@@ -29,6 +29,7 @@ from __future__ import annotations
 
 from agent.gateway import Command, Decision, Gateway, GatewayContext
 from agent.guardrails import (
+    AnswerReview,
     ArithmeticCheckResult,
     GroundingResult,
     InjectionScanResult,
@@ -36,6 +37,7 @@ from agent.guardrails import (
     abstention_policy,
     check_grounding,
     redact,
+    review_answer,
     scan_for_injected_instructions,
     verify_arithmetic,
 )
@@ -47,7 +49,9 @@ from agent.strategy import (
     disciplined_round_cost,
     careless_round_cost,
     is_catalog_trap,
+    narrow_fields,
     pick_replica,
+    round_allowance,
     should_delegate,
     successor_of,
 )
@@ -69,6 +73,8 @@ __all__ = [
     "ArithmeticCheckResult",
     "verify_arithmetic",
     "abstention_policy",
+    "AnswerReview",
+    "review_answer",
     # strategy.py
     "BudgetPacer",
     "ReplicaChoice",
@@ -78,6 +84,8 @@ __all__ = [
     "careless_round_cost",
     "is_catalog_trap",
     "pick_replica",
+    "narrow_fields",
+    "round_allowance",
     "should_delegate",
     "successor_of",
     # telemetry.py

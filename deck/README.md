@@ -145,13 +145,24 @@ even though it is not literally named `replica_flip` (`validate_deck.py`'s `R5b`
 **`deck/lineup.json`** plays all 10 attacks, none of the 4 blanks, in this order:
 
 ```
-atk_05 (schema_bomb, cheap opener) → atk_01 (shadow) → atk_04 (poisoned_result) →
-atk_08 (forged_card) → atk_03 (drift) → atk_09 (faithless_peer) → atk_06 (header_spoof) →
-atk_02 (replica_flip) → atk_10 (identity/aud) → atk_07 (identity/act, CONTRACTS' own worked case, saved for last)
+atk_05 (schema_bomb) → atk_09 (faithless_peer) → atk_04 (poisoned_result) → atk_03 (drift) →
+atk_06 (header_spoof) → atk_02 (replica_flip) → atk_07 (identity/act) →
+atk_01 (shadow) → atk_10 (identity/aud) → atk_08 (forged_card)
 ```
 
-Layers alternate deliberately (MCP, MCP, MCP, A2A, MCP, A2A, gateway, gateway, A2A, A2A) so a
-defender who hardens against whatever landed last round is still exposed the next. **Benching
+**Why this order (it was re-ordered from the starter's).** Round damage is scaled ×1.0 in
+rounds 1–3, ×1.25 in 4–7 and ×1.5 in 8–10, and a defender's credits and patience run out late — so
+the order is a lethality curve, not a list. Measured with `spar.py` against the three bots
+(`rookie` / `operator` / `adversary`), the cards whose defence is *not* a gateway denial
+(`schema_bomb`, `faithless_peer`, `poisoned_result`, `drift`: held by pinning, narrow querying,
+guardrails and cross-checking) are opened first at ×1.0, where being held costs little. The
+gateway-layer cards a careful defender can deny (`header_spoof`, `replica_flip`, `identity/act`)
+sit in the middle. The three cards that landed against **all three** bots — `shadow`,
+`identity/aud`, `forged_card` — are saved for rounds 8–10, where every point of damage is worth
+1.5×. Nothing about a card changed, only *when* it is played: the same ten cards, no repeats.
+
+Layers still alternate where it matters (MCP, A2A, MCP, MCP, gateway, gateway, A2A, MCP, A2A,
+A2A) so a defender who hardens against whatever landed last round is exposed the next. **Benching
 all 4 blanks is this starter's own aggressive choice, not a rule** — trading an attack for a
 blank, and where in the order to place it, is exactly the strategic lever RULES.md's blank
 mechanic creates. Pull it if your own deck wants to bait a false positive instead.
